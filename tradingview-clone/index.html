@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniChart – a TradingView-style chart</title>
+<style>
+  :root { --bg:#131722; --panel:#1e222d; --grid:#2a2e39; --text:#d1d4dc; --muted:#787b86;
+          --up:#26a69a; --down:#ef5350; --accent:#2962ff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text);
+              font:13px -apple-system,Segoe UI,Roboto,sans-serif; }
+  #app { display:flex; flex-direction:column; height:100%; }
+  .bar { display:flex; align-items:center; gap:4px; padding:6px 10px; background:var(--panel);
+         border-bottom:1px solid var(--grid); flex-wrap:wrap; }
+  .bar .sym { font-weight:600; font-size:15px; margin-right:10px; }
+  .bar .sep { width:1px; height:20px; background:var(--grid); margin:0 6px; }
+  button { background:none; border:0; color:var(--text); padding:5px 9px; border-radius:4px;
+           cursor:pointer; font:inherit; }
+  button:hover { background:var(--grid); }
+  button.on { color:var(--accent); background:rgba(41,98,255,.15); }
+  #main { flex:1; display:flex; min-height:0; }
+  #tools { width:44px; background:var(--panel); border-right:1px solid var(--grid);
+           display:flex; flex-direction:column; align-items:center; padding-top:6px; gap:2px; }
+  #tools button { width:36px; height:36px; padding:0; font-size:16px; }
+  #wrap { flex:1; position:relative; min-width:0; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #legend { position:absolute; left:10px; top:8px; pointer-events:none; font-size:12px;
+            text-shadow:0 0 4px var(--bg); line-height:1.6; }
+  #legend b { font-weight:500; margin-right:4px; color:var(--muted); }
+  #hint { color:var(--muted); font-size:11px; margin-left:auto; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="bar" id="topbar">
+    <span class="sym">DEMO/USD</span>
+    <span id="tfs"></span><span class="sep"></span>
+    <span id="types"></span><span class="sep"></span>
+    <span id="inds"></span>
+    <span id="hint">scroll = zoom · drag = pan · double-click = reset</span>
+  </div>
+  <div id="main">
+    <div id="tools"></div>
+    <div id="wrap"><canvas id="cv"></canvas><div id="legend"></div></div>
+  </div>
+</div>
+<script>
+"use strict";
+/* ---------- synthetic market data (1-minute bars, seeded random walk) ---------- */
+function rng(seed){ return () => (seed = (seed*1664525 + 1013904223) >>> 0) / 4294967296; }
+function gauss(r){ return Math.sqrt(-2*Math.log(r()||1e-9))*Math.cos(2*Math.PI*r()); }
+const R = rng(42);
+const MIN = 60000;
+let base1m = [];
+(function gen(){
+  let t = Math.floor(Date.now()/MIN)*MIN - 60*24*60*MIN*20, p = 100;
+  for (let i=0;i<60*24*20;i++){
+    const o=p; let h=o,l=o,c=o;
+    for (let k=0;k<4;k++){ c *= 1+gauss(R)*0.0007; h=Math.max(h,c); l=Math.min(l,c); }
+    base1m.push({t, o, h, l, c, v: Math.round(500+R()*1500+Math.abs(c-o)/o*4e5)});
+    p=c; t+=MIN;
+  }
+})();
+const TF = {"1m":1,"5m":5,"15m":15,"1h":60,"4h":240,"1D":1440};
+function aggregate(m){
+  if (m===1) return base1m.map(b=>({...b}));
+  const out=[], ms=m*MIN; let cur=null;
+  for (const b of base1m){
+    const k=Math.floor(b.t/ms)*ms;
+    if (!cur || cur.t!==k){ cur={t:k,o:b.o,h:b.h,l:b.l,c:b.c,v:b.v}; out.push(cur); }
+    else { cur.h=Math.max(cur.h,b.h); cur.l=Math.min(cur.l,b.l); cur.c=b.c; cur.v+=b.v; }
+  }
+  return out;
+}
+
+/* ---------- indicators ---------- */
+function sma(d,n){ const o=[]; let s=0;
+  for(let i=0;i<d.length;i++){ s+=d[i].c; if(i>=n) s-=d[i-n].c; o.push(i>=n-1?s/n:null);} return o; }
+function ema(d,n){ const o=[],k=2/(n+1); let e=null;
+  for(let i=0;i<d.length;i++){ e = e===null? d[i].c : d[i].c*k+e*(1-k); o.push(i>=n-1?e:null);} return o; }
+function boll(d,n,m){ const mid=sma(d,n), up=[], lo=[];
+  for(let i=0;i<d.length;i++){ if(mid[i]===null){up.push(null);lo.push(null);continue;}
+    let s=0; for(let j=i-n+1;j<=i;j++) s+=(d[j].c-mid[i])**2; const sd=Math.sqrt(s/n);
+    up.push(mid[i]+m*sd); lo.push(mid[i]-m*sd);} return {mid,up,lo}; }
+function rsi(d,n){ const o=[null]; let ag=0,al=0;
+  for(let i=1;i<d.length;i++){ const ch=d[i].c-d[i-1].c, g=Math.max(ch,0), l=Math.max(-ch,0);
+    if(i<=n){ ag+=g/n; al+=l/n; o.push(i===n?100-100/(1+ag/(al||1e-9)):null); }
+    else { ag=(ag*(n-1)+g)/n; al=(al*(n-1)+l)/n; o.push(100-100/(1+ag/(al||1e-9))); } }
+  return o; }
+
+/* ---------- state ---------- */
+const S = {
+  tf:"15m", type:"candles", data:[], ind:{sma:true, ema:false, boll:false, rsi:true},
+  barW:8, offset:0,           // offset = index of the right-most visible bar (float)
+  mouse:null, drag:null, tool:"cursor", drawings:[], pending:null, cache:{}
+};
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const AX = 64, AXH = 22;     // price-axis width, time-axis height
+let W=0,H=0;
+
+function setData(){
+  S.data = aggregate(TF[S.tf]); S.drawings=[]; S.pending=null;
+  S.offset = S.data.length-1+5; S.barW = 8; compute();
+}
+function compute(){
+  const d=S.data;
+  S.cache={sma:sma(d,20), ema:ema(d,50), boll:boll(d,20,2), rsi:rsi(d,14)};
+}
+
+/* ---------- layout / transforms ---------- */
+function layout(){
+  const rsiH = S.ind.rsi ? Math.round((H-AXH)*0.22) : 0;
+  const volH = Math.round((H-AXH-rsiH)*0.15);
+  const priceH = H-AXH-rsiH;
+  return { price:{y:0,h:priceH}, rsi:{y:priceH,h:rsiH}, vol:volH, plotW:W-AX };
+}
+const xOf = i => W-AX - (S.offset-i)*S.barW - S.barW/2;
+const iOf = x => Math.round(S.offset - (W-AX-x-S.barW/2)/S.barW);
+let pv={lo:0,hi:1};
+function niceStep(range,ticks){
+  const raw=range/ticks, mag=10**Math.floor(Math.log10(raw)), n=raw/mag;
+  return (n<1.5?1:n<3?2:n<7?5:10)*mag;
+}
+
+/* ---------- drawing helpers ---------- */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function fmtTime(t, long){
+  const d=new Date(t), p=n=>String(n).padStart(2,"0");
+  if (long) return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return TF[S.tf]>=1440 ? `${d.getMonth()+1}/${d.getDate()}` :
+         (d.getHours()===0&&d.getMinutes()===0) ? `${d.getMonth()+1}/${d.getDate()}` : `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function render(){
+  const dpr=devicePixelRatio||1;
+  W=cv.clientWidth; H=cv.clientHeight;
+  if (cv.width!==W*dpr||cv.height!==H*dpr){ cv.width=W*dpr; cv.height=H*dpr; }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle=css("--bg"); ctx.fillRect(0,0,W,H);
+  const L=layout(), d=S.data;
+  const first=Math.max(0,iOf(0)-1), last=Math.min(d.length-1,iOf(W-AX)+1);
+  if (last<first) return;
+
+  // visible price range
+  let lo=Infinity,hi=-Infinity;
+  for(let i=first;i<=last;i++){ lo=Math.min(lo,d[i].l); hi=Math.max(hi,d[i].h); }
+  if (S.ind.boll) for(let i=first;i<=last;i++){ const u=S.cache.boll.up[i],l=S.cache.boll.lo[i]; if(u!==null){hi=Math.max(hi,u);lo=Math.min(lo,l);} }
+  const pad=(hi-lo)*0.08||1; lo-=pad; hi+=pad+L.vol/L.price.h*(hi-lo);
+  pv={lo,hi};
+  const py = p => L.price.y + L.price.h - (p-lo)/(hi-lo)*L.price.h;
+  S.py=py; S.pInv = y => lo + (L.price.y+L.price.h-y)/L.price.h*(hi-lo);
+
+  // grid + price axis
+  ctx.font="11px sans-serif"; ctx.textBaseline="middle";
+  const step=niceStep(hi-lo, Math.max(3,L.price.h/55));
+  ctx.strokeStyle=css("--grid"); ctx.fillStyle=css("--muted"); ctx.lineWidth=1;
+  for(let p=Math.ceil(lo/step)*step;p<hi;p+=step){
+    const y=Math.round(py(p))+.5; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W-AX,y); ctx.stroke();
+    ctx.textAlign="left"; ctx.fillText(p.toFixed(step<1?2:0), W-AX+6, y);
+  }
+  // time axis + vertical grid
+  const every=Math.max(1,Math.round(90/S.barW));
+  ctx.textAlign="center";
+  for(let i=first-first%every;i<=last;i+=every){ if(i<0)continue; const x=Math.round(xOf(i))+.5;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H-AXH); ctx.stroke();
+    ctx.fillText(fmtTime(d[i].t), x, H-AXH/2); }
+
+  // clip to plot
+  ctx.save(); ctx.beginPath(); ctx.rect(0,0,W-AX,H-AXH); ctx.clip();
+  const up=css("--up"), dn=css("--down");
+
+  // volume
+  let vmax=1; for(let i=first;i<=last;i++) vmax=Math.max(vmax,d[i].v);
+  for(let i=first;i<=last;i++){ const b=d[i], h=b.v/vmax*L.vol;
+    ctx.fillStyle=(b.c>=b.o?up:dn)+"55";
+    ctx.fillRect(xOf(i)-S.barW*.4, L.price.h-h, S.barW*.8, h); }
+
+  // series
+  if (S.type==="candles"){
+    const w=Math.max(1,S.barW*.7);
+    for(let i=first;i<=last;i++){ const b=d[i], x=Math.round(xOf(i))+.5, col=b.c>=b.o?up:dn;
+      ctx.strokeStyle=col; ctx.fillStyle=col;
+      ctx.beginPath(); ctx.moveTo(x,py(b.h)); ctx.lineTo(x,py(b.l)); ctx.stroke();
+      const y1=py(Math.max(b.o,b.c)), y2=py(Math.min(b.o,b.c));
+      ctx.fillRect(x-w/2, y1, w, Math.max(1,y2-y1)); }
+  } else {
+    ctx.beginPath();
+    for(let i=first;i<=last;i++){ const x=xOf(i),y=py(d[i].c); i===first?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+    ctx.strokeStyle=css("--accent"); ctx.lineWidth=2; ctx.stroke(); ctx.lineWidth=1;
+    if (S.type==="area"){
+      ctx.lineTo(xOf(last),L.price.h); ctx.lineTo(xOf(first),L.price.h); ctx.closePath();
+      const g=ctx.createLinearGradient(0,0,0,L.price.h);
+      g.addColorStop(0,"rgba(41,98,255,.35)"); g.addColorStop(1,"rgba(41,98,255,0)");
+      ctx.fillStyle=g; ctx.fill();
+    }
+  }
+
+  // overlays
+  const line=(arr,col)=>{ ctx.beginPath(); let s=false;
+    for(let i=first;i<=last;i++){ if(arr[i]===null){s=false;continue;}
+      const x=xOf(i),y=py(arr[i]); s?ctx.lineTo(x,y):ctx.moveTo(x,y); s=true; }
+    ctx.strokeStyle=col; ctx.stroke(); };
+  if (S.ind.sma) line(S.cache.sma,"#f5a623");
+  if (S.ind.ema) line(S.cache.ema,"#ab47bc");
+  if (S.ind.boll){ line(S.cache.boll.up,"#42a5f5"); line(S.cache.boll.lo,"#42a5f5"); line(S.cache.boll.mid,"#42a5f588"); }
+
+  // drawings
+  ctx.strokeStyle="#ffeb3b"; ctx.lineWidth=1.5;
+  const all = S.pending ? [...S.drawings, S.pending] : S.drawings;
+  for (const dr of all){
+    if (dr.kind==="hline"){ const y=py(dr.p); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W-AX,y); ctx.stroke(); }
+    else { const x1=xOf(dr.i1),y1=py(dr.p1),x2=xOf(dr.i2),y2=py(dr.p2);
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      ctx.fillStyle="#ffeb3b"; for(const [x,y] of [[x1,y1],[x2,y2]]){ ctx.beginPath(); ctx.arc(x,y,3,0,7); ctx.fill(); } }
+  }
+  ctx.lineWidth=1;
+
+  // last price line
+  const lb=d[d.length-1], ly=py(lb.c), lc=lb.c>=lb.o?up:dn;
+  ctx.setLineDash([4,3]); ctx.strokeStyle=lc; ctx.beginPath(); ctx.moveTo(0,ly); ctx.lineTo(W-AX,ly); ctx.stroke(); ctx.setLineDash([]);
+  ctx.restore();
+  label(lb.c.toFixed(2), ly, lc, "#fff");
+
+  // RSI pane
+  if (L.rsi.h){
+    const y0=L.rsi.y, h=L.rsi.h, ry=v=>y0+h-(v/100)*h;
+    ctx.strokeStyle=css("--grid"); ctx.beginPath(); ctx.moveTo(0,y0+.5); ctx.lineTo(W,y0+.5); ctx.stroke();
+    ctx.save(); ctx.beginPath(); ctx.rect(0,y0,W-AX,h); ctx.clip();
+    ctx.fillStyle="rgba(126,87,194,.08)"; ctx.fillRect(0,ry(70),W-AX,ry(30)-ry(70));
+    ctx.setLineDash([3,3]); for(const v of [30,70]){ ctx.beginPath(); ctx.moveTo(0,ry(v)); ctx.lineTo(W-AX,ry(v)); ctx.stroke(); } ctx.setLineDash([]);
+    ctx.beginPath(); let s=false;
+    for(let i=first;i<=last;i++){ const v=S.cache.rsi[i]; if(v==null){s=false;continue;} const x=xOf(i),y=ry(v); s?ctx.lineTo(x,y):ctx.moveTo(x,y); s=true; }
+    ctx.strokeStyle="#7e57c2"; ctx.stroke(); ctx.restore();
+    ctx.fillStyle=css("--muted"); ctx.textAlign="left";
+    for(const v of [30,70]) ctx.fillText(v, W-AX+6, ry(v));
+    S.ry=ry; S.rsiInv=y=>(y0+h-y)/h*100;
+  }
+
+  // axis separators
+  ctx.strokeStyle=css("--grid");
+  ctx.beginPath(); ctx.moveTo(W-AX+.5,0); ctx.lineTo(W-AX+.5,H); ctx.moveTo(0,H-AXH+.5); ctx.lineTo(W,H-AXH+.5); ctx.stroke();
+
+  // crosshair
+  const m=S.mouse;
+  if (m && m.x<W-AX && m.y<H-AXH){
+    ctx.setLineDash([4,4]); ctx.strokeStyle=css("--muted");
+    const idx=Math.min(d.length-1,Math.max(0,iOf(m.x))), cx=Math.round(xOf(idx))+.5;
+    ctx.beginPath(); ctx.moveTo(cx,0); ctx.lineTo(cx,H-AXH); ctx.moveTo(0,m.y+.5); ctx.lineTo(W-AX,m.y+.5); ctx.stroke(); ctx.setLineDash([]);
+    if (m.y<L.price.h) label(S.pInv(m.y).toFixed(2), m.y, "#363a45", css("--text"));
+    ctx.fillStyle="#363a45"; const tw=ctx.measureText(fmtTime(d[idx].t,true)).width+14;
+    ctx.fillRect(cx-tw/2,H-AXH,tw,AXH); ctx.fillStyle=css("--text"); ctx.textAlign="center";
+    ctx.fillText(fmtTime(d[idx].t,true), cx, H-AXH/2);
+    legend(idx);
+  } else legend(d.length-1);
+}
+function label(txt,y,bg,fg){
+  ctx.fillStyle=bg; ctx.fillRect(W-AX,y-9,AX,18);
+  ctx.fillStyle=fg; ctx.textAlign="left"; ctx.textBaseline="middle"; ctx.fillText(txt,W-AX+6,y);
+}
+function legend(i){
+  const b=S.data[i]; if(!b) return;
+  const prev=S.data[i-1]||b, chg=b.c-prev.c, col=chg>=0?css("--up"):css("--down");
+  const f=n=>n.toFixed(2), c=S.cache;
+  let h=`<div><b>O</b><span style="color:${col}">${f(b.o)}</span> <b>H</b><span style="color:${col}">${f(b.h)}</span> `+
+        `<b>L</b><span style="color:${col}">${f(b.l)}</span> <b>C</b><span style="color:${col}">${f(b.c)}</span> `+
+        `<span style="color:${col}">${chg>=0?"+":""}${f(chg)} (${(chg/prev.c*100).toFixed(2)}%)</span> <b>Vol</b>${b.v.toLocaleString()}</div>`;
+  if (S.ind.sma && c.sma[i]!=null) h+=`<div style="color:#f5a623">SMA 20 ${f(c.sma[i])}</div>`;
+  if (S.ind.ema && c.ema[i]!=null) h+=`<div style="color:#ab47bc">EMA 50 ${f(c.ema[i])}</div>`;
+  if (S.ind.boll && c.boll.mid[i]!=null) h+=`<div style="color:#42a5f5">BB 20,2 ${f(c.boll.lo[i])} – ${f(c.boll.up[i])}</div>`;
+  if (S.ind.rsi && c.rsi[i]!=null) h+=`<div style="color:#7e57c2">RSI 14 ${f(c.rsi[i])}</div>`;
+  document.getElementById("legend").innerHTML=h;
+}
+
+/* ---------- interaction ---------- */
+function pos(e){ const r=cv.getBoundingClientRect(); return {x:e.clientX-r.left, y:e.clientY-r.top}; }
+function clampOffset(){ S.offset=Math.min(S.data.length+W/S.barW*0.5, Math.max(W/S.barW*0.2, S.offset)); }
+cv.addEventListener("wheel", e=>{
+  e.preventDefault(); const m=pos(e), idx=S.offset-(W-AX-m.x)/S.barW;
+  S.barW=Math.min(60,Math.max(1.5,S.barW*(e.deltaY<0?1.12:1/1.12)));
+  S.offset=idx+(W-AX-m.x)/S.barW; clampOffset(); render();
+},{passive:false});
+cv.addEventListener("mousedown", e=>{
+  const m=pos(e); if (m.x>=W-AX||m.y>=H-AXH) return;
+  if (S.tool==="hline"){ S.drawings.push({kind:"hline",p:S.pInv(m.y)}); setTool("cursor"); render(); return; }
+  if (S.tool==="trend"){
+    const i=iOf(m.x), p=S.pInv(m.y);
+    if (!S.pending) S.pending={kind:"trend",i1:i,p1:p,i2:i,p2:p};
+    else { S.drawings.push(S.pending); S.pending=null; setTool("cursor"); }
+    render(); return;
+  }
+  S.drag={x:m.x,offset:S.offset}; cv.style.cursor="grabbing";
+});
+addEventListener("mouseup", ()=>{ S.drag=null; cv.style.cursor="crosshair"; });
+cv.addEventListener("mousemove", e=>{
+  const m=pos(e); S.mouse=m;
+  if (S.drag){ S.offset=S.drag.offset-(m.x-S.drag.x)/S.barW; clampOffset(); }
+  if (S.pending && S.pInv){ S.pending.i2=iOf(m.x); S.pending.p2=S.pInv(m.y); }
+  render();
+});
+cv.addEventListener("mouseleave", ()=>{ S.mouse=null; render(); });
+cv.addEventListener("dblclick", ()=>{ S.offset=S.data.length-1+5; S.barW=8; render(); });
+addEventListener("resize", render);
+addEventListener("keydown", e=>{
+  if (e.key==="Escape"){ S.pending=null; setTool("cursor"); render(); }
+  if (e.key==="Delete"||e.key==="Backspace"){ S.drawings.pop(); render(); }
+});
+cv.style.cursor="crosshair";
+
+/* ---------- UI ---------- */
+function group(id, items, isOn, onClick){
+  const el=document.getElementById(id); el.innerHTML="";
+  for (const [key,label] of items){
+    const b=document.createElement("button"); b.textContent=label;
+    b.className=isOn(key)?"on":""; b.onclick=()=>{ onClick(key); buildUI(); render(); };
+    el.appendChild(b);
+  }
+}
+function buildUI(){
+  group("tfs", Object.keys(TF).map(k=>[k,k]), k=>k===S.tf, k=>{ S.tf=k; setData(); });
+  group("types", [["candles","Candles"],["line","Line"],["area","Area"]], k=>k===S.type, k=>S.type=k);
+  group("inds", [["sma","SMA 20"],["ema","EMA 50"],["boll","BB"],["rsi","RSI"]], k=>S.ind[k], k=>S.ind[k]=!S.ind[k]);
+  const t=document.getElementById("tools"); t.innerHTML="";
+  for (const [k,ic,tip] of [["cursor","✛","Cursor"],["trend","⟋","Trend line (click twice)"],["hline","─","Horizontal line"]]){
+    const b=document.createElement("button"); b.textContent=ic; b.title=tip; b.className=S.tool===k?"on":"";
+    b.onclick=()=>{ setTool(k); }; t.appendChild(b);
+  }
+  const clr=document.createElement("button"); clr.textContent="🗑"; clr.title="Clear drawings";
+  clr.onclick=()=>{ S.drawings=[]; S.pending=null; render(); }; t.appendChild(clr);
+}
+function setTool(k){ S.tool=k; S.pending=null; buildUI(); }
+
+/* ---------- live tick simulation ---------- */
+setInterval(()=>{
+  const d=S.data, b=d[d.length-1], last=base1m[base1m.length-1];
+  const px=last.c*(1+gauss(R)*0.0004);
+  last.c=px; last.h=Math.max(last.h,px); last.l=Math.min(last.l,px); last.v+=Math.round(R()*50);
+  b.c=px; b.h=Math.max(b.h,px); b.l=Math.min(b.l,px); b.v+=Math.round(R()*50);
+  compute(); render();
+}, 1000);
+
+buildUI(); setData(); render();
+</script>
+</body>
+</html>
